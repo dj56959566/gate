@@ -79,6 +79,7 @@ jobs:
           python - << 'EOF'
           import os
           import re
+          import json
           import urllib.request
           import urllib.parse
 
@@ -118,6 +119,24 @@ jobs:
           except Exception as e:
               print(f"解析日志出错: {e}")
 
+          # 国家列表：从脚本生成的 public/data.json 里读（按可用节点数倒序），简码小写
+          country_list = "未知"
+          try:
+              if os.path.exists("public/data.json"):
+                  with open("public/data.json", "r", encoding="utf-8") as f:
+                      data = json.load(f)
+                  counts = []
+                  for entry in data.get("countries", {}).values():
+                      code = str(entry.get("code", "")).strip().lower()
+                      n = len(entry.get("nodes", []))
+                      if code and n:
+                          counts.append((n, code))
+                  counts.sort(key=lambda x: (-x[0], x[1]))
+                  if counts:
+                      country_list = " ".join(code for _, code in counts)
+          except Exception as e:
+              print(f"解析 data.json 国家列表出错: {e}")
+
           if deploy_outcome == "success":
               message = (
                   "✅ *VPN Gate 节点检测与部署成功！*\n"
@@ -126,8 +145,9 @@ jobs:
                   f"🔧 SSTP 节点: `{sstp_nodes}`\n"
                   f"🟢 可用节点: `{valid_nodes}`\n"
                   f"🌍 国家数量: `{country_count}`\n"
+                  f"🗺️ 国家列表: `{country_list}`\n"
                   "──────────────────────\n"
-                  f"🌍 平台: Gihuthub-adjlevis\n"
+                  f"🌍 平台: Gihuthub-dj56959566\n"
                   "🌐 访问地址: [点击查看在线页面](https://dj56959566.github.io/gate/)"
               )
           else:
