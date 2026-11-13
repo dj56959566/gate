@@ -1,17 +1,52 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (精简版)
-=====================================
+VPN Gate SSTP 节点检测流水线 (精简版 + 多数据源 v2)
+=================================================
 流程:
-  1. 获取 VPN Gate 原始节点
+  1. 获取 VPN Gate 原始节点 (多源合并, 不再是官方 API 失败才回退)
   2. 只保留带 TCP 入口的 SSTP 节点
   3. 去重
   4. 并发调用检测 Worker
-  5. 生成 public/data.json + public/index.html + public/nodes.txt
+  5. 获取并合并优选域名与优选 API (Cloudflare 入口)
+  6. 生成 public/data.json + public/index.html + public/nodes.txt
+
+v2 改动 (只加数据源, 其余功能原样保留):
+  - CSV 源: 官方 API (http/https) + GeorgeXie 镜像的官方 CSV (jsDelivr / raw)
+  - JSON 源: fdciabdul (原 VPNGATE_MIRROR) + GeorgeXie servers.json (单次快照)
+            + GeorgeXie pool/servers.json (7 天滚动池, 补 US/PL/欧洲稀疏国家)
+
+v3 改动 (2026-11-13, 只加一个入口源, 节点逻辑不动):
+  - 新增 CF 中转 IP 源: https://zip.cm.edu.kg/all.txt (CMLiussss
+    "CF中转IP 更新日志频道", 每天 14:00 更新, 2026-11-13 实测 26494 行 /
+    去重 10311 IP, PL 197 IP / 216 个 IP:端口, 其中 181 个落地 WAW)
+  - 中转 IP 不是 SSTP 节点, 不能进 VPNGATE_* 节点源 (它们 443/8443 等端口
+    上没有 SSTP 服务, Worker 实测会失败); 只能进入口池, 和 EDGE_HOSTS /
+    OPTIMAL_API 一样, 做 nodes.txt 每行前面的 "入口#..." 那一部分.
+  - all.txt 格式 IP:端口#国家码, 与 OPTIMAL_API 返回的格式一致,
+    直接复用同一套 "#备注剥离 + 缺端口补 443" 解析.
+  - 每次运行实时拉取, workflow 每天跑一次就是每天更新, 不用另外写定时.
+  - 注意: all.txt 的 #国家码标签有个别不准 (如 109.122.194.61 标 #PL,
+    ip-api 和 all.json meta 都认芬兰); 但入口 IP 的地理位置不影响出口,
+    出口还是 SSTP 节点本身, 所以做入口用可以接受. 想严格按落地筛,
+    改用 all.json 按 meta.country + colo.iata (WAW) 过滤, 见函数注释.
+  - GeorgeXie 先读 latest.json 取 data_commit 再拉锁定版本, 并校验 SHA-256
+  - 池子 (pool/servers.json) 的节点没有内嵌 OpenVPN 配置, 配置在
+    pool/configs/<sha256>.json 里 (每个 13.5KB); 本脚本不逐个拉配置,
+    直接用池节点自带的 probe_targets[0].port 合成最小 TCP 配置
+    (proto tcp + remote), 再由检测 Worker 实测 SSTP 是否真通.
+    probe_reason 为 udp / 无 TCP 端口的池节点直接跳过.
+  - 默认只测目标国家 VPNGATE_COUNTRIES=US,PL,DE,FR,GB,NL,ES,IT,HK,SG
+    (设为空字符串则恢复全部国家; JP/KR 不在默认里, 因为池子里 JP 1854 / KR 1678
+     个会把 Worker 检查量撑爆, 需要时自己加 JP,KR)
+  - 实测数据 (2026-11-11, GeorgeXie):
+      单次快照 99 节点/10 国: US 1, IT 1, JP 44, KR 33, 无 PL/DE/FR/GB/NL/ES/HK/SG
+      7 天池 4952 节点: US 138, PL 2, DE 4, FR 8, GB 16, NL 5, ES 3, IT 2, HK 3, SG 1
+      所以 PL/欧洲想出节点, 必须拉 pool, 单次快照基本是 0
 """
 
 import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -40,6 +75,55 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
+
+# --- v2 新增: 多数据源 (都可用环境变量整体覆盖, 逗号分隔) ---
+def _env_list(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return list(default)
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+# CSV 源: 格式与官方 API 完全一致, 直接走 parse_csv, 无需适配
+VPNGATE_CSV_SOURCES = _env_list("VPNGATE_CSV_SOURCES", [
+    VPNGATE_API,
+    "https://www.vpngate.net/api/iphone/",
+    "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/vpngate.csv",
+    "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/data/vpngate.csv",
+])
+
+# JSON 源: 格式各不相同, 走 parse_mirror_json / parse_georgexie_json 做适配
+# 注意: pool/servers.json 约 7MB、4952 个节点, 拉取时 HTTP_TIMEOUT 要够
+VPNGATE_JSON_SOURCES = _env_list("VPNGATE_JSON_SOURCES", [
+    VPNGATE_MIRROR,
+    "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/servers.json",
+    "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/pool/servers.json",
+])
+
+GEORGEXIE_LATEST_URL = os.environ.get(
+    "GEORGEXIE_LATEST_URL",
+    "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/latest.json",
+)
+GEORGEXIE_POOL_LATEST_URL = os.environ.get(
+    "GEORGEXIE_POOL_LATEST_URL",
+    "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/latest.json",
+)
+# 1=合并所有成功源 (默认, 稀疏国家只能靠合并才有数); 0=旧行为, 第一个成功就停
+VPNGATE_MERGE = os.environ.get("VPNGATE_MERGE", "1") not in ("0", "false", "no", "")
+# 1=拉 GeorgeXie 锁定 commit 的快照做校验 (默认开); 0=只用上面列表里的 @latest
+GEORGEXIE_USE_LOCKED = os.environ.get("GEORGEXIE_USE_LOCKED", "1") not in ("0", "false", "no", "")
+
+# 目标国家: 默认 US + PL + 欧洲 + HK/SG; 为空则不过滤 (恢复旧行为, 全量)
+# JP/KR 默认不在里面, 原因见文件头注释; 需要就加, 如 "US,PL,DE,FR,GB,JP,KR"
+_raw_countries = os.environ.get("VPNGATE_COUNTRIES", "US,PL,DE,FR,GB,NL,ES,IT,HK,SG")
+TARGET_COUNTRIES = set()
+if _raw_countries.strip():
+    for _c in _raw_countries.split(","):
+        _c = _c.strip().upper()
+        if _c == "UK":
+            _c = "GB"
+        if _c:
+            TARGET_COUNTRIES.add(_c)
+
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
@@ -79,6 +163,44 @@ COUNTRY_ZH = {
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
 }
 
+# 静态优选域名池
+EDGE_HOSTS = [
+    h.strip()
+    for h in os.environ.get(
+        "EDGE_HOSTS",
+        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
+        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
+        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+    ).split(",")
+    if h.strip()
+]
+
+# 优选 API 地址配置 (支持逗号分隔多个，可配置在 GitHub Action Secret / Env 中)
+fallback_apis = [
+    "https://cf.090227.xyz/ct?ips=6&port=443",
+    "https://cf.090227.xyz/cmcc?ips=8"
+]
+OPTIMAL_API = os.environ.get("OPTIMAL_API") or fallback_apis[0]
+
+# --- v3 新增: CF 中转 IP 入口源 (只进入口池, 不进节点源) ---
+# 源地址: CMLiussss "CF中转IP 更新日志频道" 的打包下载, 每天更新.
+# all.txt 一行一个 "IP:端口#国家码"; all.json 是同数据的详细版
+# (每条带 asn / org / city / colo 落地机房, 9MB+).
+# 默认只取 TARGET_COUNTRIES 里的国家; 想只取波兰就设 TRANSIT_COUNTRIES=PL.
+TRANSIT_URL = os.environ.get(
+    "TRANSIT_URL", "https://zip.cm.edu.kg/all.txt")
+_raw_transit_countries = os.environ.get("TRANSIT_COUNTRIES", "")
+if _raw_transit_countries.strip():
+    TRANSIT_COUNTRIES = {c.strip().upper().replace("UK", "GB")
+                         for c in _raw_transit_countries.split(",") if c.strip()}
+else:
+    TRANSIT_COUNTRIES = set(TARGET_COUNTRIES)
+# 单个国家最多取多少个入口 (all.txt 全量 2.6 万行, 不截会把入口池撑爆;
+# 0 = 不截). 默认 300/国, PL 216 行全进, 其余大国各截前 300.
+TRANSIT_MAX_PER_COUNTRY = int(os.environ.get("TRANSIT_MAX_PER_COUNTRY", "300"))
+
+NODES_URL = os.environ.get("NODES_URL", "https://dj56959566.github.io/gate/nodes.txt")
+
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
@@ -99,30 +221,144 @@ def die(msg):
 # ---------------------------------------------------------------------------
 # 数据抓取
 # ---------------------------------------------------------------------------
-def fetch_vpngate():
-    try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(VPNGATE_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+def _fetch_text(session, url, timeout=None):
+    resp = session.get(url, timeout=(timeout or HTTP_TIMEOUT),
+                       headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
+    resp.raise_for_status()
+    return resp
 
+def _fetch_csv_source(session, url):
+    resp = _fetch_text(session, url)
+    rows = parse_csv(resp.text)
+    return rows
+
+def _fetch_json_source(session, url):
+    resp = _fetch_text(session, url)
+    data = resp.json()
+    # GeorgeXie 的 servers.json / pool/servers.json 字段名不同, 先走专用解析
+    rows = parse_georgexie_json(data)
+    if rows:
+        return rows
+    return parse_mirror_json(data)
+
+def fetch_georgexie_locked(session):
+    """读 latest.json 取 data_commit, 拉锁定版本的 servers.json 并校验 SHA-256.
+
+    返回 (rows, source_label), 失败返回 ([], "") —— 不致命, 调用方继续走 @latest.
+    已实测 2026-11-11: latest.json 里 files["data/servers.json"]["sha256"]
+    = 22113ab2170b78a254f9c5e3c3f23dc7a97f58167040396715b07da2b434465.
+    """
     try:
-        log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
-        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
+        idx = _fetch_text(session, GEORGEXIE_LATEST_URL).json()
+        commit = str(idx.get("data_commit") or "").strip()
+        files = idx.get("files") or {}
+        want_sha = str((files.get("data/servers.json") or {}).get("sha256") or "").lower()
+        if not commit or len(commit) != 40:
+            log("GEORGEXIE", "latest.json 里没有合法的 data_commit, 跳过锁定快照")
+            return [], ""
+        candidates = [
+            f"https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@{commit}/data/servers.json",
+            f"https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/{commit}/data/servers.json",
+        ]
+        for url in candidates:
+            try:
+                resp = _fetch_text(session, url)
+                if want_sha:
+                    got_sha = hashlib.sha256(resp.content).hexdigest()
+                    if got_sha != want_sha:
+                        log("GEORGEXIE", f"锁定快照 SHA-256 不符 ({url[:60]}...), 跳过该候选")
+                        continue
+                rows = parse_georgexie_json(resp.json())
+                if rows:
+                    log("GEORGEXIE", f"锁定快照 commit {commit[:8]} 获取到 {len(rows)} 个节点")
+                    return rows, f"georgexie-locked@{commit[:8]}"
+            except Exception as exc:
+                log("GEORGEXIE", f"锁定快照候选失败 {url[:60]}...: {exc}")
+        return [], ""
     except Exception as exc:
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败")
+        log("GEORGEXIE", f"读 latest.json 失败: {exc}")
+        return [], ""
+
+def fetch_vpngate():
+    """多源合并抓取 (v2): CSV 源 + JSON 源 + GeorgeXie 锁定快照, 全部去重后返回.
+
+    旧行为是官方 API 成功就直接返回、失败才试镜像; 新行为默认合并所有成功源,
+    因为单次快照里 US 只有 1 个、PL/DE/FR/GB 经常是 0, 只有加上 7 天 pool
+    才能在目标国家拿到数. 想恢复旧行为: VPNGATE_MERGE=0.
+    返回 (rows, source_label), rows 已按 TARGET_COUNTRIES 过滤 (为空则不过滤).
+    """
+    session = requests.Session()
+    all_rows = []
+    used = []
+
+    # 1) GeorgeXie 锁定快照 (有 SHA 校验, 最可信的镜像快照)
+    if GEORGEXIE_USE_LOCKED:
+        rows, label = fetch_georgexie_locked(session)
+        if rows:
+            all_rows.extend(rows)
+            used.append(label)
+
+    # 2) CSV 源 (官方 + GeorgeXie CSV, 格式一致)
+    for url in VPNGATE_CSV_SOURCES:
+        try:
+            rows = _fetch_csv_source(session, url)
+            if rows:
+                log("VPN GATE", f"CSV 源 {url} 获取到 {len(rows)} 个原始节点")
+                all_rows.extend(rows)
+                used.append(url)
+                if not VPNGATE_MERGE:
+                    break
+            else:
+                log("VPN GATE", f"CSV 源 {url} 返回 0 行, 跳过")
+        except Exception as exc:
+            log("VPN GATE", f"CSV 源失败 {url}: {exc}")
+
+    # 3) JSON 源 (fdciabdul + GeorgeXie servers.json + pool/servers.json)
+    for url in VPNGATE_JSON_SOURCES:
+        try:
+            rows = _fetch_json_source(session, url)
+            if rows:
+                log("VPN GATE", f"JSON 源 {url} 获取到 {len(rows)} 个原始节点")
+                all_rows.extend(rows)
+                used.append(url)
+                if not VPNGATE_MERGE:
+                    break
+            else:
+                log("VPN GATE", f"JSON 源 {url} 返回 0 行, 跳过")
+        except Exception as exc:
+            log("VPN GATE", f"JSON 源失败 {url}: {exc}")
+
+    if not all_rows:
+        die("所有 VPN Gate 数据源均不可用, 数据源完全失败")
+
+    # 去重: 同一个 host+ip 只留一条 (多源是同一份官方数据的不同托管, 重叠很大)
+    seen = set()
+    uniq = []
+    for r in all_rows:
+        key = ((r.get("host") or "").lower(), (r.get("ip") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+    log("VPN GATE", f"多源合并: 原始 {len(all_rows)} -> 去重后 {len(uniq)}")
+
+    # 目标国家过滤 (只影响本次测试量, 不改节点本身)
+    if TARGET_COUNTRIES:
+        before = len(uniq)
+        uniq = [r for r in uniq
+                if (r.get("country_short") or "").upper().replace("UK", "GB") in TARGET_COUNTRIES]
+        log("VPN GATE", f"目标国家过滤 {sorted(TARGET_COUNTRIES)}: {before} -> {len(uniq)}")
+        # 每个目标国家各有几个, 一眼看出 PL/欧洲有没有数
+        counts = {}
+        for r in uniq:
+            counts[r.get("country_short") or "?"] = counts.get(r.get("country_short") or "?", 0) + 1
+        log("VPN GATE", f"目标国家分布: {counts}")
+        if not uniq:
+            log("VPN GATE", "过滤后 0 个节点: 本轮快照+池子里目标国家都没有, "
+                            "这是常态 (PL 单次常为 0, 靠 pool 7 天累积), 下次再跑或放宽 VPNGATE_COUNTRIES")
+
+    source = "merged:" + "+".join(used) if used else "vpngate-merged"
+    return uniq, source
 
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -147,7 +383,13 @@ def parse_csv(text):
             if "base64" in h.lower():
                 idx["openvpn_configdata_base64"] = i
                 break
-    pos = {"hostname": idx.get("hostname", 0), "ip": idx.get("ip", 1), "countrylong": idx.get("countrylong", 5), "countryshort": idx.get("countryshort", 6), "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
+    pos = {
+        "hostname": idx.get("hostname", 0),
+        "ip": idx.get("ip", 1),
+        "countrylong": idx.get("countrylong", 5),
+        "countryshort": idx.get("countryshort", 6),
+        "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1),
+    }
 
     rows = []
     for ln in data_lines:
@@ -156,7 +398,95 @@ def parse_csv(text):
         host = fields[pos["hostname"]].strip()
         ip = fields[pos["ip"]].strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": fields[pos["countrylong"]].strip(), "country_short": fields[pos["countryshort"]].strip(), "config_b64": fields[pos["openvpn_configdata_base64"]].strip()})
+        rows.append({
+            "host": host,
+            "ip": ip,
+            "country_long": fields[pos["countrylong"]].strip(),
+            "country_short": fields[pos["countryshort"]].strip(),
+            "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
+        })
+    return rows
+
+def _synth_tcp_config(ip, port):
+    """给只有探测端口、没有内嵌配置的池节点合成最小 OpenVPN 配置.
+
+    只含 to_sstp_nodes() 需要的两行 (proto tcp + remote), 其余什么都没有.
+    SSTP 端口是否真的通, 由后面的检测 Worker 实测决定, 这里不作断言.
+    """
+    text = f"proto tcp\nremote {ip} {port}\n"
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+def parse_georgexie_json(data):
+    """GeorgeXie servers.json / pool/servers.json 专用解析.
+
+    实测结构 (2026-11-11), 两种格式:
+    - servers.json (单次快照): {"servers": [{"country_code": "JP",
+      "country_name": "Japan", "hostname": "vpn961954281",
+      "ip": "126.214.179.9", "openvpn_config_base64": "IyMj...", ...}]}
+      内嵌配置, 直接用.
+    - pool/servers.json (7 天池): 同样字段, 但 *没有* openvpn_config_base64,
+      只有 config.path (如 pool/configs/<sha256>.json, 每个 13.5KB, 逐个拉
+      90 个目标节点要多发 90 次请求) 和 probe_targets / tcp_probe.
+      已实测: PL 节点 vpn191172008 的 probe_targets=[{"ip": ..., "port": 1382}],
+      DE 节点 port 443, GB 节点 port 1708, 与 OpenVPN 配置里的 TCP remote 端口
+      同一量级. 所以池节点不用拉配置文件, 直接用 probe_targets[0].port
+      合成最小配置, 交给 to_sstp_nodes() + Worker 实测过滤.
+      probe_reason == "udp" / probe_targets 为空的节点没有 TCP 端口,
+      不能做 SSTP, 直接跳过 (不计入 rows).
+    不是这个结构时返回 [], 调用方再走 parse_mirror_json.
+    """
+    servers = []
+    if isinstance(data, dict) and isinstance(data.get("servers"), list):
+        # 只有含 country_code / openvpn_config_base64 的才是 GeorgeXie 格式
+        sample = data["servers"][:1]
+        if sample and ("country_code" in sample[0] or "openvpn_config_base64" in sample[0]):
+            servers = data["servers"]
+        else:
+            return []
+    elif isinstance(data, list):
+        return []
+    else:
+        return []
+    rows = []
+    for s in servers:
+        if not isinstance(s, dict):
+            continue
+        host = str(s.get("hostname") or s.get("host") or "").strip()
+        ip = str(s.get("ip") or "").strip()
+        if not host or not ip:
+            continue
+        config_b64 = str(s.get("openvpn_config_base64")
+                         or s.get("openvpn_configdata_base64")
+                         or s.get("config_b64") or "").strip()
+        if not config_b64:
+            # 池格式: 从探测到的 TCP 端口合成最小配置 (见函数头注释)
+            port = None
+            targets = s.get("probe_targets") or []
+            if targets and isinstance(targets, list):
+                for t in targets:
+                    if isinstance(t, dict) and t.get("port"):
+                        try:
+                            port = int(t["port"])
+                        except (TypeError, ValueError):
+                            port = None
+                        break
+            if port is None:
+                ep = (s.get("tcp_probe") or {}).get("connected_endpoint") or {}
+                if isinstance(ep, dict) and ep.get("port"):
+                    try:
+                        port = int(ep["port"])
+                    except (TypeError, ValueError):
+                        port = None
+            if port is None or not (1 <= port <= 65535):
+                continue
+            config_b64 = _synth_tcp_config(ip, port)
+        rows.append({
+            "host": host,
+            "ip": ip,
+            "country_long": str(s.get("country_name") or s.get("countrylong") or "").strip(),
+            "country_short": str(s.get("country_code") or s.get("countryshort") or "").strip(),
+            "config_b64": config_b64,
+        })
     return rows
 
 def parse_mirror_json(data):
@@ -172,8 +502,132 @@ def parse_mirror_json(data):
         host = str(s.get("hostname") or s.get("host") or "").strip()
         ip = str(s.get("ip") or "").strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
+        # v2: 兼容 GeorgeXie 的字段别名 country_code / country_name /
+        # openvpn_config_base64 (fdciabdul 原字段仍优先)
+        rows.append({
+            "host": host,
+            "ip": ip,
+            "country_long": str(s.get("countrylong") or s.get("country_long")
+                                or s.get("country_name") or s.get("country") or "").strip(),
+            "country_short": str(s.get("countryshort") or s.get("country_short")
+                                 or s.get("country_code") or "").strip(),
+            "config_b64": str(s.get("openvpn_configdata_base64")
+                              or s.get("openvpn_config_base64")
+                              or s.get("config_b64") or "").strip(),
+        })
     return rows
+
+# ---------------------------------------------------------------------------
+# 优选 API 获取与解析
+# ---------------------------------------------------------------------------
+def fetch_optimal_api_endpoints(api_urls_str):
+    """
+    拉取优选 API，解析如: 172.66.1.179:443#CF 电信优选 格式的内容
+    提取出纯 'IP:端口' (例如 172.66.1.179:443)
+    """
+    if not api_urls_str.strip():
+        return []
+
+    endpoints = []
+    urls = [u.strip() for u in api_urls_str.split(",") if u.strip()]
+    for url in urls:
+        try:
+            log("OPTIMAL API", f"请求优选 API: {url}")
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                lines = resp.text.strip().splitlines()
+                count = 0
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # 剥离 # 后的备注，提取 IP:端口
+                    endpoint = line.split("#")[0].strip()
+                    if endpoint:
+                        # 补充缺失端口默认 443
+                        if ":" not in endpoint:
+                            endpoint = f"{endpoint}:443"
+                        endpoints.append(endpoint)
+                        count += 1
+                log("OPTIMAL API", f"成功从 API 获取到 {count} 个优选端点")
+            else:
+                log("OPTIMAL API", f"API 返回状态码异常: {resp.status_code}")
+        except Exception as e:
+            log("OPTIMAL API", f"拉取优选 API 失败 ({url}): {e}")
+    return endpoints
+
+def fetch_transit_endpoints(url, countries):
+    """
+    v3: 拉取 CF 中转 IP 列表 (zip.cm.edu.kg/all.txt), 只取指定国家的行.
+
+    格式: 一行一个 "IP:端口#国家码", 如 145.239.83.203:443#PL;
+    端口缺失时补 443. 返回去重后的 ["IP:端口", ...] (按文件顺序).
+    注意 all.txt 的 #国家码有个别错标 (见文件头 v3 注释), 做入口用可接受;
+    如需严格按落地 (如只要 WAW), 改拉 all.json, 按
+    meta.country == "PL" 且 meta.colo.iata == "WAW" 过滤 (2026-11-13
+    实测 PL 197 IP 里 181 个是 WAW).
+    失败返回 [] (不致命, 入口池还有静态域名 + OPTIMAL_API).
+    """
+    if not url or not countries:
+        return []
+    try:
+        log("TRANSIT", f"请求中转 IP 源: {url}")
+        resp = requests.get(url, timeout=HTTP_TIMEOUT,
+                            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
+        resp.raise_for_status()
+        endpoints = []
+        seen = set()
+        per_country = {}
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            endpoint, _, tag = line.partition("#")
+            endpoint = endpoint.strip()
+            cc = (tag.strip().upper().replace("UK", "GB") or "?")
+            if cc not in countries:
+                continue
+            if ":" not in endpoint:
+                endpoint = f"{endpoint}:443"
+            if endpoint in seen:
+                continue
+            if TRANSIT_MAX_PER_COUNTRY > 0:
+                n = per_country.get(cc, 0)
+                if n >= TRANSIT_MAX_PER_COUNTRY:
+                    continue
+                per_country[cc] = n + 1
+            seen.add(endpoint)
+            endpoints.append(endpoint)
+        log("TRANSIT", f"中转 IP 入口: {len(endpoints)} 个, 分国家 {per_country}")
+        return endpoints
+    except Exception as exc:
+        log("TRANSIT", f"拉取中转 IP 源失败 ({url}): {exc}")
+        return []
+
+def get_combined_edge_hosts():
+    """
+    合并静态优选域名与优选 API 端点
+    """
+    # 1. 优先读取 HOSTS_ENTRY 或 EDGE_HOSTS
+    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+    static_hosts = [e.strip() for e in _entry.split(",") if e.strip()] if _entry else EDGE_HOSTS
+
+    # 2. 拉取优选 API 端点
+    api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
+
+    # 3. v3: 拉取 CF 中转 IP 入口 (zip.cm.edu.kg/all.txt, 每天更新)
+    transit_hosts = fetch_transit_endpoints(TRANSIT_URL, TRANSIT_COUNTRIES)
+
+    # 4. 合并与去重 (保留原始列表顺序)
+    combined = []
+    seen = set()
+    for h in static_hosts + api_hosts + transit_hosts:
+        if h and h not in seen:
+            seen.add(h)
+            combined.append(h)
+
+    log("EDGE POOL", f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 中转 IP {len(transit_hosts)} 个, 合并有效入口共 {len(combined)} 个")
+    return combined if combined else EDGE_HOSTS
 
 # ---------------------------------------------------------------------------
 # 筛选 SSTP 节点
@@ -252,7 +706,17 @@ def check_one(node, session):
         if exit_info:
             asn = exit_info.get("asn") or {}
             org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {"ip": exit_info.get("ip"), "country": exit_info.get("country"), "country_code": exit_info.get("country_code"), "city": exit_info.get("city"), "continent": exit_info.get("continent"), "asn": asn.get("asn"), "org": org, "type": asn.get("type"), "is_datacenter": exit_info.get("is_datacenter")}
+            out["exit"] = {
+                "ip": exit_info.get("ip"),
+                "country": exit_info.get("country"),
+                "country_code": exit_info.get("country_code"),
+                "city": exit_info.get("city"),
+                "continent": exit_info.get("continent"),
+                "asn": asn.get("asn"),
+                "org": org,
+                "type": asn.get("type"),
+                "is_datacenter": exit_info.get("is_datacenter"),
+            }
             out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
         else:
             out["residential"] = classify_network(out["host"], None, None)
@@ -280,7 +744,16 @@ def build_outputs(results, raw_count, sstp_count, source):
         c = n["country"] or "未知"
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
-    stats = {"raw_nodes": raw_count, "sstp_nodes": sstp_count, "checked": len(results), "success": len(available), "failed": len(results) - len(available), "countries": len(countries), "residential_est": sum(1 for n in available if n["residential"] == "residential"), "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter")}
+    stats = {
+        "raw_nodes": raw_count,
+        "sstp_nodes": sstp_count,
+        "checked": len(results),
+        "success": len(available),
+        "failed": len(results) - len(available),
+        "countries": len(countries),
+        "residential_est": sum(1 for n in available if n["residential"] == "residential"),
+        "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+    }
     by_country = {}
     for name, grp in countries.items():
         grp["count"] = len(grp["nodes"])
@@ -289,28 +762,22 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
         by_country[name] = grp
 
-    data = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "source": source, "worker": WORKER_CHECK_URL, "stats": stats, "countries": by_country, "available": available}
+    data = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "source": source,
+        "worker": WORKER_CHECK_URL,
+        "stats": stats,
+        "countries": by_country,
+        "available": available,
+    }
     return data
 
-# edgetunnel 入口地址池
-EDGE_HOSTS = [
-    h.strip()
-    for h in os.environ.get(
-        "EDGE_HOSTS",
-        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,xn--b6gac.eu.org:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,cloudflare.182682.xyz:443,ipv4.eee.xx.kg:443,cf.090227.xyz:443,cf.877771.xyz:443,"
-        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,russia.com:443,uspto.gov:443,www.vmware.com:443",
-    ).split(",")
-    if h.strip()
-]
-
-NODES_URL = os.environ.get("NODES_URL", "https://dj56959566.github.io/gate/nodes.txt")
-
-def build_nodes_text(data):
-    """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
+def build_nodes_text(data, edge_hosts):
+    """
+    生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
+    """
     countries = data["countries"]
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+    edge = edge_hosts
     lines = []
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
@@ -330,7 +797,7 @@ def build_nodes_text(data):
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-def write_outputs(data):
+def write_outputs(data, edge_hosts):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
     with open(data_path, "w", encoding="utf-8") as f:
@@ -341,15 +808,17 @@ def write_outputs(data):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
             html = f.read()
     else:
-        html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
-                "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
-                "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
+        html = (
+            "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
+            "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
+            "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>"
+        )
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data))
+        f.write(build_nodes_text(data, edge_hosts))
 
     return data_path, html_path, nodes_path
 
@@ -396,11 +865,14 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, nodes_path = write_outputs(data)
+    # 动态拉取 API 并与静态优选域名混合
+    edge_hosts = get_combined_edge_hosts()
+
+    data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
-    log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后每 30 分钟自动更新)")
+    log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后自动更新)")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 if __name__ == "__main__":
