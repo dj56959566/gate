@@ -128,7 +128,7 @@ jobs:
                   f"🌍 国家数量: `{country_count}`\n"
                   "──────────────────────\n"
                   f"🌍 平台: Gihuthub-adjlevis\n"
-                  "🌐 访问地址: [点击查看在线页面](https://adjlevis.github.io/gate/)"
+                  "🌐 访问地址: [点击查看在线页面](https://dj56959566.github.io/gate/)"
               )
           else:
               message = (
