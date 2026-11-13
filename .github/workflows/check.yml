@@ -147,7 +147,7 @@ jobs:
                   f"🌍 国家数量: `{country_count}`\n"
                   f"🗺️ 国家列表: `{country_list}`\n"
                   "──────────────────────\n"
-                  f"🌍 平台: Gihuthub-dj56959566\n"
+                  f"🌍 平台: [{repo}]({site})\n"
                   "🌐 访问地址: [点击查看在线页面](https://dj56959566.github.io/gate/)"
               )
           else:
