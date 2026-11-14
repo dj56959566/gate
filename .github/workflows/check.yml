@@ -86,6 +86,8 @@ jobs:
           bot_token = os.environ.get("TG_BOT_TOKEN")
           chat_id = os.environ.get("TG_CHAT_ID")
           deploy_outcome = os.environ.get("DEPLOY_OUTCOME", "unknown")
+          repo = os.environ.get("GITHUB_REPOSITORY", "dj56959566/gate")
+          site = "https://dj56959566.github.io/gate/"
 
           if not bot_token or not chat_id:
               print("Telegram 密钥未配置，跳过发送")
