@@ -71,7 +71,7 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Show site URL
-        run: 'echo "site: https://你的GitHub用户名.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+        run: 'echo "site: https://${{ github.repository_owner }}.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
 
       - name: Send Detailed Telegram Notification
         if: always()
@@ -86,8 +86,9 @@ jobs:
           bot_token = os.environ.get("TG_BOT_TOKEN")
           chat_id = os.environ.get("TG_CHAT_ID")
           deploy_outcome = os.environ.get("DEPLOY_OUTCOME", "unknown")
-          repo = os.environ.get("GITHUB_REPOSITORY", "dj56959566/gate")
-          site = "https://dj56959566.github.io/gate/"
+          repo = os.environ.get("GITHUB_REPOSITORY", "djbadboy-56959566-qq-com/gate")
+          # 站点地址从仓库名派生,不写死组织名:组织改名后 GITHUB_REPOSITORY 会变,链接自动跟着变
+          site = f"https://{repo.split('/')[0]}.github.io/gate/"
 
           if not bot_token or not chat_id:
               print("Telegram 密钥未配置，跳过发送")
@@ -150,7 +151,7 @@ jobs:
                   f"🗺️ 国家列表: `{country_list}`\n"
                   "──────────────────────\n"
                   f"🌍 平台: [{repo}]({site})\n"
-                  "🌐 访问地址: [点击查看在线页面](https://dj56959566.github.io/gate/)"
+                  f"🌐 访问地址: [点击查看在线页面]({site})"
               )
           else:
               message = (
