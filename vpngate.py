@@ -199,7 +199,10 @@ else:
 # 0 = 不截). 默认 300/国, PL 216 行全进, 其余大国各截前 300.
 TRANSIT_MAX_PER_COUNTRY = int(os.environ.get("TRANSIT_MAX_PER_COUNTRY", "300"))
 
-NODES_URL = os.environ.get("NODES_URL", "https://dj56959566.github.io/gate/nodes.txt")
+# 节点订阅地址跟着仓库走:组织改名后 GITHUB_REPOSITORY 会变,不要写死旧组织名;
+# 本地跑(没有这个环境变量)时用当前组织名顶上,想固定就设 NODES_URL.
+_REPO_OWNER = os.environ.get("GITHUB_REPOSITORY", "djbadboy-56959566-qq-com/gate").split("/")[0]
+NODES_URL = os.environ.get("NODES_URL", f"https://{_REPO_OWNER}.github.io/gate/nodes.txt")
 
 # ---------------------------------------------------------------------------
 # 日志
